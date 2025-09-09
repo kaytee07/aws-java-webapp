@@ -31,7 +31,7 @@ jobs:
           ECR_REPOSITORY: java-app-repo
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          # Build with commit SHA
+          # Build with commit SHAA
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           # Tag also as 'latest'
           docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
