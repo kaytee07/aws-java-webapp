@@ -1,4 +1,4 @@
-name: Build, Push to ECR and Deploy to ECSS.
+name: Build, Push to ECR and Deploy to ECS
 
 on:
   push:
@@ -14,6 +14,7 @@ env:
   CONTAINER_PORT: 8080
   CODE_DEPLOY_APP: SpringBootCodeDeployApp
   CODE_DEPLOY_GROUP: SpringBootDeploymentGroup
+  TASK_DEFINITION_FAMILY: spring-boot-task-definition
 
 jobs:
   build-and-push:
@@ -53,7 +54,12 @@ jobs:
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
-      - name: Create appspec.yaml
+      - name: Get current task definition
+        run: |
+          TASK_DEF_JSON=$(aws ecs describe-task-definition --task-definition ${{ env.TASK_DEFINITION_FAMILY }} --query 'taskDefinition')
+          echo "TASK_DEF_JSON=$TASK_DEF_JSON" >> $GITHUB_ENV
+
+      - name: Create appspec.yaml with placeholder
         run: |
           cat > appspec.yaml << EOF
           version: 0.0
@@ -73,6 +79,17 @@ jobs:
           name: appspec
           path: appspec.yaml
 
+      - name: Upload task definition JSON artifact
+        run: |
+          echo '${{ env.TASK_DEF_JSON }}' > task-definition.json
+        shell: bash
+
+      - name: Upload task definition artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: task-definition
+          path: task-definition.json
+
   deploy:
     runs-on: ubuntu-latest
     needs: build-and-push
@@ -86,64 +103,89 @@ jobs:
         with:
           name: appspec
 
+      - name: Download task definition JSON
+        uses: actions/download-artifact@v4
+        with:
+          name: task-definition
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::714377355835:role/taylor-ecs-iam-policy-GitHubOidcRole-CqMPvnHBh8zq
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Get current task definition
-        id: get-task-def
-        run: |
-          CURRENT_TASK_DEF=$(aws ecs describe-services \
-            --cluster ${{ env.ECS_CLUSTER }} \
-            --services ${{ env.ECS_SERVICE }} \
-            --query 'services[0].taskDefinition' \
-            --output text)
-          echo "CURRENT_TASK_DEF=$CURRENT_TASK_DEF" >> $GITHUB_ENV
-
       - name: Register new task definition
         id: register-task
         run: |
-          # Create new task definition with updated image
-          aws ecs register-task-definition \
-            --cli-input-json "$(aws ecs describe-task-definition \
-              --task-definition ${{ env.CURRENT_TASK_DEF }} \
-              --query 'taskDefinition' | \
-            jq --arg image "$ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}" \
-               '.containerDefinitions[0].image = $image | 
-                del(.taskDefinitionArn) | 
-                del(.revision) | 
-                del(.status) | 
-                del(.requiresAttributes) | 
-                del(.compatibilities) | 
-                del(.registeredAt) | 
-                del(.registeredBy)')" \
-            --output text
+          # Update the image in the task definition
+          UPDATED_TASK_DEF=$(jq --arg image "$ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}" \
+            '.containerDefinitions[0].image = $image | 
+             del(.taskDefinitionArn) | 
+             del(.revision) | 
+             del(.status) | 
+             del(.requiresAttributes) | 
+             del(.compatibilities) | 
+             del(.registeredAt) | 
+             del(.registeredBy) | 
+             del(.deregisteredAt)' task-definition.json)
+          
+          echo "$UPDATED_TASK_DEF" > updated-task-definition.json
+          
+          # Register the new task definition
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://updated-task-definition.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          
+          echo "NEW_TASK_DEF_ARN=$NEW_TASK_DEF_ARN" >> $GITHUB_ENV
+
+      - name: Update appspec.yaml with new task definition ARN
+        run: |
+          # Replace the placeholder with the actual task definition ARN
+          sed -i "s|<TASK_DEFINITION>|$NEW_TASK_DEF_ARN|g" appspec.yaml
+          cat appspec.yaml
 
       - name: Create CodeDeploy deployment
         run: |
-          aws deploy create-deployment \
+          # Create deployment using the updated appspec.yaml
+          DEPLOYMENT_ID=$(aws deploy create-deployment \
             --application-name ${{ env.CODE_DEPLOY_APP }} \
             --deployment-group-name ${{ env.CODE_DEPLOY_GROUP }} \
             --revision '{
               "revisionType": "AppSpecContent",
               "appSpecContent": {
-                "content": "'"$(cat appspec.yaml | jq -s -R .)"'",
-                "sha256": "'"$(sha256sum appspec.yaml | cut -d\" \" -f1)"'"
+                "content": "'"$(cat appspec.yaml | sed 's/"/\\"/g' | tr -d '\n')"'",
+                "sha256": "'"$(sha256sum appspec.yaml | awk '{print $1}')"'"
               }
-            }'
+            }' \
+            --query 'deploymentId' \
+            --output text)
+          
+          echo "DEPLOYMENT_ID=$DEPLOYMENT_ID" >> $GITHUB_ENV
 
       - name: Wait for deployment to complete
         run: |
-          # Get the latest deployment ID
-          DEPLOYMENT_ID=$(aws deploy list-deployments \
-            --application-name ${{ env.CODE_DEPLOY_APP }} \
-            --deployment-group-name ${{ env.CODE_DEPLOY_GROUP }} \
-            --max-items 1 \
-            --query 'deployments[0]' \
-            --output text)
+          if [ -n "$DEPLOYMENT_ID" ] && [ "$DEPLOYMENT_ID" != "None" ]; then
+            echo "Waiting for deployment $DEPLOYMENT_ID to complete..."
+            aws deploy wait deployment-successful \
+              --deployment-id $DEPLOYMENT_ID
+            echo "Deployment completed successfully!"
+          else
+            echo "No deployment ID found. Checking if deployment was created..."
+            # Fallback: check for any recent deployments
+            LATEST_DEPLOYMENT=$(aws deploy list-deployments \
+              --application-name ${{ env.CODE_DEPLOY_APP }} \
+              --deployment-group-name ${{ env.CODE_DEPLOY_GROUP }} \
+              --max-items 1 \
+              --query 'deployments[0]' \
+              --output text)
           
-          # Wait for deployment to complete
-          aws deploy wait deployment-successful \
-            --deployment-id $DEPLOYMENT_ID
+            if [ -n "$LATEST_DEPLOYMENT" ] && [ "$LATEST_DEPLOYMENT" != "None" ]; then
+              echo "Waiting for latest deployment $LATEST_DEPLOYMENT to complete..."
+              aws deploy wait deployment-successful \
+                --deployment-id $LATEST_DEPLOYMENT
+              echo "Deployment completed successfully!"
+            else
+              echo "No deployments found. This might be the first deployment."
+            fi
+          fi
