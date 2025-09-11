@@ -89,7 +89,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::714377355835:role/taylor-ecs-iam-policy-stack-GitHubOidcRole-TaDKPAGjNeWN
+          role-to-assume: arn:aws:iam::714377355835:role/taylor-ecs-iam-policy-GitHubOidcRole-CqMPvnHBh8zq
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Get current task definition
