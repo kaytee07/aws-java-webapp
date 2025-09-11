@@ -75,10 +75,16 @@ jobs:
       - name: Create default task definition if not exists
         if: env.TASK_DEF_EXISTS == 'false'
         run: |
+          # Get the actual ECS task execution role ARN
+          ECS_TASK_EXECUTION_ROLE_ARN=$(aws cloudformation describe-stacks \
+            --stack-name taylor-ecs-iam-policy \
+            --query 'Stacks[0].Outputs[?OutputKey==`EcsTaskExecutionRoleArn`].OutputValue' \
+            --output text)
+          
           cat > task-definition.json << EOF
           {
             "family": "${{ env.TASK_DEFINITION_FAMILY }}",
-            "executionRoleArn": "arn:aws:iam::714377355835:role/ecsTaskExecutionRole",
+            "executionRoleArn": "$ECS_TASK_EXECUTION_ROLE_ARN",
             "networkMode": "awsvpc",
             "cpu": "256",
             "memory": "512",
@@ -158,6 +164,27 @@ jobs:
           role-to-assume: arn:aws:iam::714377355835:role/taylor-ecs-iam-policy-GitHubOidcRole-CqMPvnHBh8zq
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Check if CodeDeploy application exists
+        id: check-codedeploy
+        run: |
+          if aws deploy get-application --application-name ${{ env.CODE_DEPLOY_APP }} > /dev/null 2>&1; then
+            echo "CODEDEPLOY_EXISTS=true" >> $GITHUB_ENV
+            echo "CodeDeploy application exists"
+          
+            # Check if deployment group exists
+            if aws deploy get-deployment-group --application-name ${{ env.CODE_DEPLOY_APP }} --deployment-group-name ${{ env.CODE_DEPLOY_GROUP }} > /dev/null 2>&1; then
+              echo "DEPLOYMENT_GROUP_EXISTS=true" >> $GITHUB_ENV
+              echo "Deployment group exists"
+            else
+              echo "DEPLOYMENT_GROUP_EXISTS=false" >> $GITHUB_ENV
+              echo "Deployment group does not exist"
+            fi
+          else
+            echo "CODEDEPLOY_EXISTS=false" >> $GITHUB_ENV
+            echo "DEPLOYMENT_GROUP_EXISTS=false" >> $GITHUB_ENV
+            echo "CodeDeploy application does not exist"
+          fi
+
       - name: Register new task definition
         id: register-task
         run: |
@@ -199,20 +226,61 @@ jobs:
           echo "Updated appspec.yaml:"
           cat appspec.yaml
 
-      - name: Create CodeDeploy deployment
+      - name: Create appspec.json for CodeDeploy
         run: |
-          # Create deployment using the updated appspec.yaml
-          APPSPEC_CONTENT=$(cat appspec.yaml | jq -s -R .)
-          APPSPEC_SHA256=$(sha256sum appspec.yaml | awk '{print $1}')
+          # Create a proper JSON file for CodeDeploy
+          cat > appspec.json << EOF
+          {
+            "version": 0.0,
+            "Resources": [
+              {
+                "TargetService": {
+                  "Type": "AWS::ECS::Service",
+                  "Properties": {
+                    "TaskDefinition": "$NEW_TASK_DEF_ARN",
+                    "LoadBalancerInfo": {
+                      "ContainerName": "${{ env.CONTAINER_NAME }}",
+                      "ContainerPort": ${{ env.CONTAINER_PORT }}
+                    }
+                  }
+                }
+              }
+            ]
+          }
+          EOF
+          echo "Created appspec.json for CodeDeploy"
+
+      - name: Create zip archive for CodeDeploy
+        run: |
+          # Create a zip file containing the appspec.json
+          zip appspec.zip appspec.json
+          echo "Created appspec.zip"
+
+      - name: Upload appspec.zip to S3 for CodeDeploy
+        if: env.CODEDEPLOY_EXISTS == 'true' && env.DEPLOYMENT_GROUP_EXISTS == 'true'
+        run: |
+          # Create a unique S3 key for this deployment
+          S3_KEY="codedeploy/appspec-$(date +%Y%m%d-%H%M%S).zip"
           
+          # Upload to S3 (you'll need to create an S3 bucket first)
+          # Replace 'your-codedeploy-bucket' with your actual bucket name
+          aws s3 cp appspec.zip s3://your-codedeploy-bucket/$S3_KEY
+          
+          echo "S3_OBJECT_URL=s3://your-codedeploy-bucket/$S3_KEY" >> $GITHUB_ENV
+          echo "Uploaded appspec.zip to S3"
+
+      - name: Create CodeDeploy deployment using S3
+        if: env.CODEDEPLOY_EXISTS == 'true' && env.DEPLOYMENT_GROUP_EXISTS == 'true'
+        run: |
           DEPLOYMENT_ID=$(aws deploy create-deployment \
             --application-name ${{ env.CODE_DEPLOY_APP }} \
             --deployment-group-name ${{ env.CODE_DEPLOY_GROUP }} \
             --revision '{
-              "revisionType": "AppSpecContent",
-              "appSpecContent": {
-                "content": '"$APPSPEC_CONTENT"',
-                "sha256": "'"$APPSPEC_SHA256"'"
+              "revisionType": "S3",
+              "s3Location": {
+                "bucket": "your-codedeploy-bucket",
+                "key": "'"$(echo $S3_OBJECT_URL | cut -d'/' -f4-)"'",
+                "bundleType": "zip"
               }
             }' \
             --query 'deploymentId' \
@@ -221,19 +289,56 @@ jobs:
           echo "DEPLOYMENT_ID=$DEPLOYMENT_ID" >> $GITHUB_ENV
           echo "Created deployment: $DEPLOYMENT_ID"
 
-      - name: Wait for deployment to complete
+      - name: Create CodeDeploy deployment using inline AppSpec (alternative)
+        if: env.CODEDEPLOY_EXISTS == 'true' && env.DEPLOYMENT_GROUP_EXISTS == 'true' && env.DEPLOYMENT_ID == ''
         run: |
-          if [ -n "$DEPLOYMENT_ID" ] && [ "$DEPLOYMENT_ID" != "None" ]; then
-            echo "Waiting for deployment $DEPLOYMENT_ID to complete..."
-            aws deploy wait deployment-successful \
-              --deployment-id $DEPLOYMENT_ID
-            echo "Deployment completed successfully!"
-          else
-            echo "No deployment ID found. This might be the first deployment or an error occurred."
-            echo "Checking if service needs to be created..."
+          # Alternative method using inline AppSpec content (simpler)
+          APPSPEC_CONTENT=$(cat appspec.json | jq -c .)
           
-            # Check if ECS service exists
-            if ! aws ecs describe-services --cluster ${{ env.ECS_CLUSTER }} --services ${{ env.ECS_SERVICE }} > /dev/null 2>&1; then
-              echo "Service does not exist. You may need to create the ECS service first."
-            fi
-          fi
+          DEPLOYMENT_ID=$(aws deploy create-deployment \
+            --application-name ${{ env.CODE_DEPLOY_APP }} \
+            --deployment-group-name ${{ env.CODE_DEPLOY_GROUP }} \
+            --revision '{
+              "revisionType": "AppSpecContent",
+              "appSpecContent": {
+                "content": '"$APPSPEC_CONTENT"',
+                "sha256": "'"$(sha256sum appspec.json | awk '{print $1}')"'"
+              }
+            }' \
+            --query 'deploymentId' \
+            --output text)
+          
+          echo "DEPLOYMENT_ID=$DEPLOYMENT_ID" >> $GITHUB_ENV
+          echo "Created deployment using inline AppSpec: $DEPLOYMENT_ID"
+
+      - name: Wait for deployment to complete
+        if: env.CODEDEPLOY_EXISTS == 'true' && env.DEPLOYMENT_GROUP_EXISTS == 'true' && env.DEPLOYMENT_ID != ''
+        run: |
+          echo "Waiting for deployment $DEPLOYMENT_ID to complete..."
+          aws deploy wait deployment-successful \
+            --deployment-id $DEPLOYMENT_ID
+          echo "Deployment completed successfully!"
+
+      - name: Skip deployment if CodeDeploy doesn't exist
+        if: env.CODEDEPLOY_EXISTS == 'false' || env.DEPLOYMENT_GROUP_EXISTS == 'false'
+        run: |
+          echo "Skipping CodeDeploy deployment - CodeDeploy resources do not exist yet"
+          echo "Updating ECS service directly instead..."
+          
+          # Fallback: update ECS service directly
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --task-definition $NEW_TASK_DEF_ARN \
+            --force-new-deployment
+          
+          echo "ECS service updated with new task definition"
+
+      - name: Wait for ECS service stability
+        if: env.CODEDEPLOY_EXISTS == 'false' || env.DEPLOYMENT_GROUP_EXISTS == 'false'
+        run: |
+          echo "Waiting for ECS service to become stable..."
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }}
+          echo "ECS service is now stable!"
