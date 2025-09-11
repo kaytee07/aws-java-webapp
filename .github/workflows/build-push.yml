@@ -54,10 +54,59 @@ jobs:
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
-      - name: Get current task definition
+      - name: Check if task definition exists
+        id: check-task-def
+        run: |
+          if aws ecs describe-task-definition --task-definition ${{ env.TASK_DEFINITION_FAMILY }} > /dev/null 2>&1; then
+            echo "TASK_DEF_EXISTS=true" >> $GITHUB_ENV
+            echo "Task definition exists"
+          else
+            echo "TASK_DEF_EXISTS=false" >> $GITHUB_ENV
+            echo "Task definition does not exist (first deployment)"
+          fi
+
+      - name: Get existing task definition if available
+        if: env.TASK_DEF_EXISTS == 'true'
         run: |
           TASK_DEF_JSON=$(aws ecs describe-task-definition --task-definition ${{ env.TASK_DEFINITION_FAMILY }} --query 'taskDefinition')
-          echo "TASK_DEF_JSON=$TASK_DEF_JSON" >> $GITHUB_ENV
+          echo "$TASK_DEF_JSON" > task-definition.json
+          echo "TASK_DEF_JSON=$(echo $TASK_DEF_JSON | base64 -w 0)" >> $GITHUB_ENV
+
+      - name: Create default task definition if not exists
+        if: env.TASK_DEF_EXISTS == 'false'
+        run: |
+          cat > task-definition.json << EOF
+          {
+            "family": "${{ env.TASK_DEFINITION_FAMILY }}",
+            "executionRoleArn": "arn:aws:iam::714377355835:role/ecsTaskExecutionRole",
+            "networkMode": "awsvpc",
+            "cpu": "256",
+            "memory": "512",
+            "requiresCompatibilities": ["FARGATE"],
+            "containerDefinitions": [
+              {
+                "name": "${{ env.CONTAINER_NAME }}",
+                "image": "$ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}",
+                "portMappings": [
+                  {
+                    "containerPort": ${{ env.CONTAINER_PORT }},
+                    "protocol": "tcp"
+                  }
+                ],
+                "essential": true,
+                "logConfiguration": {
+                  "logDriver": "awslogs",
+                  "options": {
+                    "awslogs-group": "/ecs/${{ env.TASK_DEFINITION_FAMILY }}",
+                    "awslogs-region": "${{ env.AWS_REGION }}",
+                    "awslogs-stream-prefix": "ecs"
+                  }
+                }
+              }
+            ]
+          }
+          EOF
+          echo "TASK_DEF_EXISTS=false" >> $GITHUB_ENV
 
       - name: Create appspec.yaml with placeholder
         run: |
@@ -78,11 +127,6 @@ jobs:
         with:
           name: appspec
           path: appspec.yaml
-
-      - name: Upload task definition JSON artifact
-        run: |
-          echo '${{ env.TASK_DEF_JSON }}' > task-definition.json
-        shell: bash
 
       - name: Upload task definition artifact
         uses: actions/upload-artifact@v4
@@ -117,17 +161,25 @@ jobs:
       - name: Register new task definition
         id: register-task
         run: |
-          # Update the image in the task definition
-          UPDATED_TASK_DEF=$(jq --arg image "$ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}" \
-            '.containerDefinitions[0].image = $image | 
-             del(.taskDefinitionArn) | 
-             del(.revision) | 
-             del(.status) | 
-             del(.requiresAttributes) | 
-             del(.compatibilities) | 
-             del(.registeredAt) | 
-             del(.registeredBy) | 
-             del(.deregisteredAt)' task-definition.json)
+          # Check if we need to update an existing task definition or create a new one
+          if jq -e '.taskDefinitionArn' task-definition.json > /dev/null 2>&1; then
+            # Update existing task definition
+            echo "Updating existing task definition..."
+            UPDATED_TASK_DEF=$(jq --arg image "$ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}" \
+              '.containerDefinitions[0].image = $image | 
+               del(.taskDefinitionArn) | 
+               del(.revision) | 
+               del(.status) | 
+               del(.requiresAttributes) | 
+               del(.compatibilities) | 
+               del(.registeredAt) | 
+               del(.registeredBy) | 
+               del(.deregisteredAt)' task-definition.json)
+          else
+            # Use the default task definition (first deployment)
+            echo "Creating new task definition (first deployment)..."
+            UPDATED_TASK_DEF=$(cat task-definition.json)
+          fi
           
           echo "$UPDATED_TASK_DEF" > updated-task-definition.json
           
@@ -138,30 +190,36 @@ jobs:
             --output text)
           
           echo "NEW_TASK_DEF_ARN=$NEW_TASK_DEF_ARN" >> $GITHUB_ENV
+          echo "Registered new task definition: $NEW_TASK_DEF_ARN"
 
       - name: Update appspec.yaml with new task definition ARN
         run: |
           # Replace the placeholder with the actual task definition ARN
           sed -i "s|<TASK_DEFINITION>|$NEW_TASK_DEF_ARN|g" appspec.yaml
+          echo "Updated appspec.yaml:"
           cat appspec.yaml
 
       - name: Create CodeDeploy deployment
         run: |
           # Create deployment using the updated appspec.yaml
+          APPSPEC_CONTENT=$(cat appspec.yaml | jq -s -R .)
+          APPSPEC_SHA256=$(sha256sum appspec.yaml | awk '{print $1}')
+          
           DEPLOYMENT_ID=$(aws deploy create-deployment \
             --application-name ${{ env.CODE_DEPLOY_APP }} \
             --deployment-group-name ${{ env.CODE_DEPLOY_GROUP }} \
             --revision '{
               "revisionType": "AppSpecContent",
               "appSpecContent": {
-                "content": "'"$(cat appspec.yaml | sed 's/"/\\"/g' | tr -d '\n')"'",
-                "sha256": "'"$(sha256sum appspec.yaml | awk '{print $1}')"'"
+                "content": '"$APPSPEC_CONTENT"',
+                "sha256": "'"$APPSPEC_SHA256"'"
               }
             }' \
             --query 'deploymentId' \
             --output text)
           
           echo "DEPLOYMENT_ID=$DEPLOYMENT_ID" >> $GITHUB_ENV
+          echo "Created deployment: $DEPLOYMENT_ID"
 
       - name: Wait for deployment to complete
         run: |
@@ -171,21 +229,11 @@ jobs:
               --deployment-id $DEPLOYMENT_ID
             echo "Deployment completed successfully!"
           else
-            echo "No deployment ID found. Checking if deployment was created..."
-            # Fallback: check for any recent deployments
-            LATEST_DEPLOYMENT=$(aws deploy list-deployments \
-              --application-name ${{ env.CODE_DEPLOY_APP }} \
-              --deployment-group-name ${{ env.CODE_DEPLOY_GROUP }} \
-              --max-items 1 \
-              --query 'deployments[0]' \
-              --output text)
+            echo "No deployment ID found. This might be the first deployment or an error occurred."
+            echo "Checking if service needs to be created..."
           
-            if [ -n "$LATEST_DEPLOYMENT" ] && [ "$LATEST_DEPLOYMENT" != "None" ]; then
-              echo "Waiting for latest deployment $LATEST_DEPLOYMENT to complete..."
-              aws deploy wait deployment-successful \
-                --deployment-id $LATEST_DEPLOYMENT
-              echo "Deployment completed successfully!"
-            else
-              echo "No deployments found. This might be the first deployment."
+            # Check if ECS service exists
+            if ! aws ecs describe-services --cluster ${{ env.ECS_CLUSTER }} --services ${{ env.ECS_SERVICE }} > /dev/null 2>&1; then
+              echo "Service does not exist. You may need to create the ECS service first."
             fi
           fi
