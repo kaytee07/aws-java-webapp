@@ -15,7 +15,6 @@ env:
   CODE_DEPLOY_APP: SpringBootCodeDeployApp
   CODE_DEPLOY_GROUP: SpringBootDeploymentGroup
   TASK_DEFINITION_FAMILY: spring-boot-task-definition
-  S3_BUCKET: your-codedeploy-bucket  # Replace with your actual S3 bucket name
 
 jobs:
   build-and-push:
@@ -41,6 +40,15 @@ jobs:
         with:
           role-to-assume: arn:aws:iam::714377355835:role/taylor-ecs-iam-policy-GitHubOidcRole-CqMPvnHBh8zq
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get S3 bucket name from CloudFormation
+        run: |
+          S3_BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name taylor-ecs-iam-policy \
+            --query 'Stacks[0].Outputs[?OutputKey==`S3BucketName`].OutputValue' \
+            --output text)
+          echo "S3_BUCKET=$S3_BUCKET" >> $GITHUB_ENV
+          echo "Using S3 bucket: $S3_BUCKET"
 
       - name: Login to Amazon ECR
         id: login-ecr
@@ -175,6 +183,33 @@ jobs:
           role-to-assume: arn:aws:iam::714377355835:role/taylor-ecs-iam-policy-GitHubOidcRole-CqMPvnHBh8zq
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Get S3 bucket name from CloudFormation
+        run: |
+          S3_BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name taylor-ecs-iam-policy \
+            --query 'Stacks[0].Outputs[?OutputKey==`S3BucketName`].OutputValue' \
+            --output text)
+          echo "S3_BUCKET=$S3_BUCKET" >> $GITHUB_ENV
+          echo "Using S3 bucket: $S3_BUCKET"
+
+      - name: Check if CodeDeploy application and group exist
+        id: check-codedeploy
+        run: |
+          if aws deploy get-application --application-name ${{ env.CODE_DEPLOY_APP }} > /dev/null 2>&1; then
+            echo "CODEDEPLOY_APP_EXISTS=true" >> $GITHUB_ENV
+            if aws deploy get-deployment-group --application-name ${{ env.CODE_DEPLOY_APP }} --deployment-group-name ${{ env.CODE_DEPLOY_GROUP }} > /dev/null 2>&1; then
+              echo "CODEDEPLOY_GROUP_EXISTS=true" >> $GITHUB_ENV
+              echo "CodeDeploy application and deployment group exist"
+            else
+              echo "CODEDEPLOY_GROUP_EXISTS=false" >> $GITHUB_ENV
+              echo "CodeDeploy deployment group does not exist"
+            fi
+          else
+            echo "CODEDEPLOY_APP_EXISTS=false" >> $GITHUB_ENV
+            echo "CODEDEPLOY_GROUP_EXISTS=false" >> $GITHUB_ENV
+            echo "CodeDeploy application does not exist"
+          fi
+
       - name: Register new task definition
         id: register-task
         run: |
@@ -244,7 +279,7 @@ jobs:
             --deployment-id $ACTIVE_DEPLOYMENT_ID \
             --auto-rollback-enabled
           echo "Deployment stopped. Waiting for cleanup..."
-          sleep 10
+          sleep 15
 
       - name: Upload AppSpec to S3 for CodeDeploy
         run: |
@@ -313,3 +348,10 @@ jobs:
               --output table
             exit 1
           fi
+
+      - name: Clean up S3 artifacts
+        run: |
+          # Clean up the uploaded appspec file after successful deployment
+          S3_KEY=$(echo $S3_OBJECT_URL | cut -d'/' -f4-)
+          aws s3 rm s3://${{ env.S3_BUCKET }}/$S3_KEY
+          echo "Cleaned up S3 artifact: $S3_KEY"
