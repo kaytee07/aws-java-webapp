@@ -1,4 +1,4 @@
-name: Build, Push to ECR and Deploy to ECS.
+name: Build, Push to ECR and Deploy to ECS
 
 on:
   push:
@@ -15,6 +15,8 @@ env:
   CODE_DEPLOY_APP: SpringBootCodeDeployApp
   CODE_DEPLOY_GROUP: SpringBootDeploymentGroup
   TASK_DEFINITION_FAMILY: spring-boot-task-definition
+  # Default S3 bucket name - will be overridden by CloudFormation output if available
+  S3_BUCKET: 714377355835-springboot-artifacts
 
 jobs:
   build-and-push:
@@ -41,14 +43,19 @@ jobs:
           role-to-assume: arn:aws:iam::714377355835:role/taylor-ecs-iam-policy-GitHubOidcRole-CqMPvnHBh8zq
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Get S3 bucket name from CloudFormation
+      - name: Try to get S3 bucket name from CloudFormation (optional)
         run: |
-          S3_BUCKET=$(aws cloudformation describe-stacks \
+          # Try to get S3 bucket from CloudFormation, but fall back to env variable if it fails
+          if S3_BUCKET_CFN=$(aws cloudformation describe-stacks \
             --stack-name taylor-ecs-iam-policy \
             --query 'Stacks[0].Outputs[?OutputKey==`S3BucketName`].OutputValue' \
-            --output text)
-          echo "S3_BUCKET=$S3_BUCKET" >> $GITHUB_ENV
-          echo "Using S3 bucket: $S3_BUCKET"
+            --output text 2>/dev/null) && [ -n "$S3_BUCKET_CFN" ]; then
+            echo "S3_BUCKET=$S3_BUCKET_CFN" >> $GITHUB_ENV
+            echo "Using S3 bucket from CloudFormation: $S3_BUCKET_CFN"
+          else
+            echo "Using default S3 bucket: ${{ env.S3_BUCKET }}"
+            echo "S3_BUCKET=${{ env.S3_BUCKET }}" >> $GITHUB_ENV
+          fi
 
       - name: Login to Amazon ECR
         id: login-ecr
@@ -183,14 +190,19 @@ jobs:
           role-to-assume: arn:aws:iam::714377355835:role/taylor-ecs-iam-policy-GitHubOidcRole-CqMPvnHBh8zq
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Get S3 bucket name from CloudFormation
+      - name: Try to get S3 bucket name from CloudFormation (optional)
         run: |
-          S3_BUCKET=$(aws cloudformation describe-stacks \
+          # Try to get S3 bucket from CloudFormation, but fall back to env variable if it fails
+          if S3_BUCKET_CFN=$(aws cloudformation describe-stacks \
             --stack-name taylor-ecs-iam-policy \
             --query 'Stacks[0].Outputs[?OutputKey==`S3BucketName`].OutputValue' \
-            --output text)
-          echo "S3_BUCKET=$S3_BUCKET" >> $GITHUB_ENV
-          echo "Using S3 bucket: $S3_BUCKET"
+            --output text 2>/dev/null) && [ -n "$S3_BUCKET_CFN" ]; then
+            echo "S3_BUCKET=$S3_BUCKET_CFN" >> $GITHUB_ENV
+            echo "Using S3 bucket from CloudFormation: $S3_BUCKET_CFN"
+          else
+            echo "Using default S3 bucket: ${{ env.S3_BUCKET }}"
+            echo "S3_BUCKET=${{ env.S3_BUCKET }}" >> $GITHUB_ENV
+          fi
 
       - name: Check if CodeDeploy application and group exist
         id: check-codedeploy
@@ -288,10 +300,10 @@ jobs:
           S3_KEY="appspec/appspec-${TIMESTAMP}-${GITHUB_SHA:0:8}.json"
           
           # Upload to S3
-          aws s3 cp appspec.json s3://${{ env.S3_BUCKET }}/$S3_KEY
+          aws s3 cp appspec.json s3://$S3_BUCKET/$S3_KEY
           
-          echo "S3_OBJECT_URL=s3://${{ env.S3_BUCKET }}/$S3_KEY" >> $GITHUB_ENV
-          echo "Uploaded appspec.json to S3: $S3_OBJECT_URL"
+          echo "S3_OBJECT_URL=s3://$S3_BUCKET/$S3_KEY" >> $GITHUB_ENV
+          echo "Uploaded appspec.json to S3: s3://$S3_BUCKET/$S3_KEY"
 
       - name: Create CodeDeploy deployment using S3
         run: |
@@ -306,7 +318,7 @@ jobs:
             --revision '{
               "revisionType": "S3",
               "s3Location": {
-                "bucket": "${{ env.S3_BUCKET }}",
+                "bucket": "'"$S3_BUCKET"'",
                 "key": "'"$S3_KEY"'",
                 "bundleType": "JSON"
               }
@@ -314,44 +326,4 @@ jobs:
             --query 'deploymentId' \
             --output text)
           
-          if [ -n "$DEPLOYMENT_ID" ] && [ "$DEPLOYMENT_ID" != "None" ]; then
-            echo "DEPLOYMENT_ID=$DEPLOYMENT_ID" >> $GITHUB_ENV
-            echo "Created CodeDeploy deployment: $DEPLOYMENT_ID"
-          else
-            echo "Failed to create CodeDeploy deployment"
-            exit 1
-          fi
-
-      - name: Wait for CodeDeploy deployment to complete
-        run: |
-          echo "Waiting for deployment $DEPLOYMENT_ID to complete..."
-          aws deploy wait deployment-successful \
-            --deployment-id $DEPLOYMENT_ID
-          echo "Deployment completed successfully!"
-
-      - name: Monitor deployment status
-        run: |
-          # Get detailed deployment status
-          DEPLOYMENT_STATUS=$(aws deploy get-deployment \
-            --deployment-id $DEPLOYMENT_ID \
-            --query 'deploymentInfo.status' \
-            --output text)
-          
-          echo "Deployment status: $DEPLOYMENT_STATUS"
-          
-          if [ "$DEPLOYMENT_STATUS" != "Succeeded" ]; then
-            echo "Deployment did not succeed. Status: $DEPLOYMENT_STATUS"
-            # Get deployment events for debugging
-            aws deploy list-deployment-instances \
-              --deployment-id $DEPLOYMENT_ID \
-              --query 'instancesList' \
-              --output table
-            exit 1
-          fi
-
-      - name: Clean up S3 artifacts
-        run: |
-          # Clean up the uploaded appspec file after successful deployment
-          S3_KEY=$(echo $S3_OBJECT_URL | cut -d'/' -f4-)
-          aws s3 rm s3://${{ env.S3_BUCKET }}/$S3_KEY
-          echo "Cleaned up S3 artifact: $S3_KEY"
+          if [ -n "$DEPLOYMENT_ID" ] && [ "$DEPLOYMENT_ID" != "None
