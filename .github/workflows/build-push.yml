@@ -312,14 +312,19 @@ jobs:
             --query 'deploymentId' \
             --output text)
           
+          echo "DEPLOYMENT_ID=$DEPLOYMENT_ID" >> $GITHUB_ENV
           echo "Created new deployment: $DEPLOYMENT_ID"
 
       - name: Monitor deployment status
         run: |
+          if [ -z "$DEPLOYMENT_ID" ]; then
+            echo "Error: DEPLOYMENT_ID is not set"
+            exit 1
+          fi
           echo "Monitoring deployment status for $DEPLOYMENT_ID..."
           while true; do
             STATUS=$(aws deploy get-deployment \
-              --deployment-id $DEPLOYMENT_ID \
+              --deployment-id "$DEPLOYMENT_ID" \
               --query 'deploymentInfo.status' \
               --output text)
           
@@ -331,7 +336,7 @@ jobs:
             elif [[ "$STATUS" == "Failed" || "$STATUS" == "Stopped" ]]; then
               echo "Deployment failed or stopped!"
               aws deploy get-deployment \
-                --deployment-id $DEPLOYMENT_ID \
+                --deployment-id "$DEPLOYMENT_ID" \
                 --query 'deploymentInfo.errorInformation' \
                 --output table
               exit 1
