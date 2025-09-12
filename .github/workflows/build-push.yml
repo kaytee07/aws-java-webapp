@@ -1,4 +1,4 @@
-name: Build and Push to Amazon ECR
+name: Build, Push, and Upload Deployment Bundle
 
 on:
   push:
@@ -11,12 +11,11 @@ permissions:
 env:
   AWS_REGION: "eu-west-1"
   ECR_REPOSITORY: "spring-boot-app-repo"
+  ARTIFACT_BUCKET: "springboot-codedeploy-artifacts" # must match your CFN template
 
 jobs:
-  build-and-push:
-    name: Build and Push Docker Image
+  build-and-deploy:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -45,18 +44,69 @@ jobs:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          # Build image with both SHA and latest tags
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
-
-          # Push both tags
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker build -t $IMAGE_URI .
+          docker tag $IMAGE_URI $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $IMAGE_URI
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
+
+      - name: Generate taskdef.json
+        run: |
+          cat > taskdef.json <<EOL
+          {
+            "family": "spring-boot-task",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "512",
+            "memory": "1024",
+            "containerDefinitions": [
+              {
+                "name": "spring-boot-container",
+                "image": "${IMAGE_URI}",
+                "portMappings": [
+                  {
+                    "containerPort": 8080,
+                    "protocol": "tcp"
+                  }
+                ],
+                "essential": true
+              }
+            ]
+          }
+          EOL
+
+      - name: Generate appspec.json
+        run: |
+          cat > appspec.json <<EOL
+          {
+            "version": 1,
+            "Resources": [
+              {
+                "TargetService": {
+                  "Type": "AWS::ECS::Service",
+                  "Properties": {
+                    "TaskDefinition": "taskdef.json",
+                    "LoadBalancerInfo": {
+                      "ContainerName": "spring-boot-container",
+                      "ContainerPort": 8080
+                    }
+                  }
+                }
+              }
+            ]
+          }
+          EOL
+
+      - name: Package AppSpec bundle
+        run: zip appspec-bundle.zip appspec.json taskdef.json
+
+      - name: Upload bundle to S3
+        run: aws s3 cp appspec-bundle.zip s3://${{ env.ARTIFACT_BUCKET }}/
 
       - name: Deployment Summary
         run: |
-          echo "🚀 Deployment Complete!"
-          echo "- Docker image pushed to ECR"
-          echo "- Tags: 'latest' and '${{ github.sha }}'"
-          echo "- CodePipeline will be triggered by 'latest'"
-          echo "- You can trace deployments to commit SHAs in ECR console"
+          echo "🚀 Deployment bundle uploaded!"
+          echo "- Image: $IMAGE_URI"
+          echo "- Bundle: s3://${{ env.ARTIFACT_BUCKET }}/appspec-bundle.zip"
+          echo "- CodePipeline will automatically pick up this artifact."
