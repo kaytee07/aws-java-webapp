@@ -1,35 +1,33 @@
-name: Build, Push to ECR and Deploy to ECS
+name: Build and Push to Amazon ECR
 
 on:
   push:
-    branches: [ main ]
+    branches: ["main"]
+
+permissions:
+  id-token: write
+  contents: read
 
 env:
-  AWS_REGION: eu-west-1
-  ECR_REGISTRY: 714377355835.dkr.ecr.eu-west-1.amazonaws.com
-  ECR_REPOSITORY: spring-boot-app-repo
-  ECS_CLUSTER: SpringBootCluster
-  ECS_SERVICE: spring-boot-service
-  CONTAINER_NAME: spring-boot-container
+  AWS_REGION: "eu-west-1"
+  ECR_REPOSITORY: "spring-boot-app-repo"
+  S3_BUCKET: "springboot-codedeploy-artifacts"
+  ECS_TASK_DEFINITION: "spring-boot-task-definition"
+  CONTAINER_NAME: "spring-boot-container"
+  ECS_CLUSTER_STACK_NAME: "taylor-ecs-iam-policy"
   CONTAINER_PORT: 8080
-  CODE_DEPLOY_APP: SpringBootCodeDeployApp
-  CODE_DEPLOY_GROUP: SpringBootDeploymentGroup
-  TASK_DEFINITION_FAMILY: spring-boot-task-definition
-  # Default S3 bucket name - will be overridden by CloudFormation output if available
-  S3_BUCKET: 714377355835-springboot-artifacts
 
 jobs:
   build-and-push:
+    name: Build and Push Docker Image
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
 
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up JDK
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v4
         with:
           java-version: '21'
           distribution: 'temurin'
@@ -37,89 +35,80 @@ jobs:
       - name: Build with Maven
         run: mvn clean package
 
-      - name: Configure AWS credentials
+      - name: Configure AWS Credentials using OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::714377355835:role/taylor-ecs-iam-policy-GitHubOidcRole-CqMPvnHBh8zq
           aws-region: ${{ env.AWS_REGION }}
+          role-session-name: ECSPushFromGitHubActions
 
-      - name: Try to get S3 bucket name from CloudFormation (optional)
-        run: |
-          # Try to get S3 bucket from CloudFormation, but fall back to env variable if it fails
-          if S3_BUCKET_CFN=$(aws cloudformation describe-stacks \
-            --stack-name taylor-ecs-iam-policy \
-            --query 'Stacks[0].Outputs[?OutputKey==`S3BucketName`].OutputValue' \
-            --output text 2>/dev/null) && [ -n "$S3_BUCKET_CFN" ]; then
-            echo "S3_BUCKET=$S3_BUCKET_CFN" >> $GITHUB_ENV
-            echo "Using S3 bucket from CloudFormation: $S3_BUCKET_CFN"
-          else
-            echo "Using default S3 bucket: ${{ env.S3_BUCKET }}"
-            echo "S3_BUCKET=${{ env.S3_BUCKET }}" >> $GITHUB_ENV
-          fi
-
-      - name: Login to Amazon ECR
+      - name: Log in to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, tag, and push image to ECR
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
         env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image-uri=$ECR_REGISTRY/$ECR_REPOSITORY:latest" >> $GITHUB_OUTPUT
 
-      - name: Check if task definition exists
-        id: check-task-def
+      - name: Get ECS Task Execution Role ARN
+        id: get-execution-role
         run: |
-          if aws ecs describe-task-definition --task-definition ${{ env.TASK_DEFINITION_FAMILY }} > /dev/null 2>&1; then
-            echo "TASK_DEF_EXISTS=true" >> $GITHUB_ENV
-            echo "Task definition exists"
-          else
-            echo "TASK_DEF_EXISTS=false" >> $GITHUB_ENV
-            echo "Task definition does not exist (first deployment)"
-          fi
-
-      - name: Get existing task definition if available
-        if: env.TASK_DEF_EXISTS == 'true'
-        run: |
-          TASK_DEF_JSON=$(aws ecs describe-task-definition --task-definition ${{ env.TASK_DEFINITION_FAMILY }} --query 'taskDefinition')
-          echo "$TASK_DEF_JSON" > task-definition.json
-          echo "TASK_DEF_JSON=$(echo $TASK_DEF_JSON | base64 -w 0)" >> $GITHUB_ENV
-
-      - name: Create default task definition if not exists
-        if: env.TASK_DEF_EXISTS == 'false'
-        run: |
-          # Get the actual ECS task execution role ARN from CloudFormation
-          ECS_TASK_EXECUTION_ROLE_ARN=$(aws cloudformation describe-stacks \
-            --stack-name taylor-ecs-iam-policy \
+          EXECUTION_ROLE_ARN=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.ECS_CLUSTER_STACK_NAME }} \
             --query 'Stacks[0].Outputs[?OutputKey==`EcsTaskExecutionRoleArn`].OutputValue' \
             --output text)
-          
-          cat > task-definition.json << EOF
+          echo "execution-role-arn=$EXECUTION_ROLE_ARN" >> $GITHUB_OUTPUT
+
+      - name: Create deployment files
+        env:
+          IMAGE_URI: ${{ steps.build-image.outputs.image-uri }}
+          EXECUTION_ROLE_ARN: ${{ steps.get-execution-role.outputs.execution-role-arn }}
+        run: |
+          # CodeDeploy AppSpec (YAML format for reliability)
+          cat > appspec.yml << EOF
+          version: 0.0
+          Resources:
+            - TargetService:
+                Type: AWS::ECS::Service
+                Properties:
+                  TaskDefinition: <TASK_DEFINITION>
+                  LoadBalancerInfo:
+                    ContainerName: "${{ env.CONTAINER_NAME }}"
+                    ContainerPort: ${{ env.CONTAINER_PORT }}
+          EOF
+
+          # ECS Task Definition JSON
+          cat > taskdef.json << EOF
           {
-            "family": "${{ env.TASK_DEFINITION_FAMILY }}",
-            "executionRoleArn": "$ECS_TASK_EXECUTION_ROLE_ARN",
+            "family": "${{ env.ECS_TASK_DEFINITION }}",
             "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
             "cpu": "256",
             "memory": "512",
-            "requiresCompatibilities": ["FARGATE"],
+            "executionRoleArn": "$EXECUTION_ROLE_ARN",
             "containerDefinitions": [
               {
                 "name": "${{ env.CONTAINER_NAME }}",
-                "image": "$ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}",
+                "image": "$IMAGE_URI",
+                "essential": true,
                 "portMappings": [
                   {
                     "containerPort": ${{ env.CONTAINER_PORT }},
                     "protocol": "tcp"
                   }
                 ],
-                "essential": true,
                 "logConfiguration": {
                   "logDriver": "awslogs",
                   "options": {
-                    "awslogs-group": "/ecs/${{ env.TASK_DEFINITION_FAMILY }}",
+                    "awslogs-group": "/ecs/${{ env.ECS_TASK_DEFINITION }}",
                     "awslogs-region": "${{ env.AWS_REGION }}",
                     "awslogs-stream-prefix": "ecs"
                   }
@@ -128,213 +117,36 @@ jobs:
             ]
           }
           EOF
-          echo "TASK_DEF_EXISTS=false" >> $GITHUB_ENV
 
-      - name: Create appspec.json for CodeDeploy
-        run: |
-          # Create a proper JSON file for CodeDeploy (will be updated with actual task definition ARN later)
-          cat > appspec.json << EOF
-          {
-            "version": 0.0,
-            "Resources": [
-              {
-                "TargetService": {
-                  "Type": "AWS::ECS::Service",
-                  "Properties": {
-                    "TaskDefinition": "<TASK_DEFINITION>",
-                    "LoadBalancerInfo": {
-                      "ContainerName": "${{ env.CONTAINER_NAME }}",
-                      "ContainerPort": ${{ env.CONTAINER_PORT }}
-                    }
-                  }
-                }
-              }
-            ]
-          }
-          EOF
-          echo "Created appspec.json for CodeDeploy"
-
-      - name: Upload task definition artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: task-definition
-          path: task-definition.json
-
-      - name: Upload appspec artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: appspec
-          path: appspec.json
-
-  deploy:
-    runs-on: ubuntu-latest
-    needs: build-and-push
-    permissions:
-      id-token: write
-      contents: read
-
-    steps:
-      - name: Download appspec.json
-        uses: actions/download-artifact@v4
-        with:
-          name: appspec
-
-      - name: Download task definition JSON
-        uses: actions/download-artifact@v4
-        with:
-          name: task-definition
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::714377355835:role/taylor-ecs-iam-policy-GitHubOidcRole-CqMPvnHBh8zq
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Try to get S3 bucket name from CloudFormation (optional)
-        run: |
-          # Try to get S3 bucket from CloudFormation, but fall back to env variable if it fails
-          if S3_BUCKET_CFN=$(aws cloudformation describe-stacks \
-            --stack-name taylor-ecs-iam-policy \
-            --query 'Stacks[0].Outputs[?OutputKey==`S3BucketName`].OutputValue' \
-            --output text 2>/dev/null) && [ -n "$S3_BUCKET_CFN" ]; then
-            echo "S3_BUCKET=$S3_BUCKET_CFN" >> $GITHUB_ENV
-            echo "Using S3 bucket from CloudFormation: $S3_BUCKET_CFN"
-          else
-            echo "Using default S3 bucket: ${{ env.S3_BUCKET }}"
-            echo "S3_BUCKET=${{ env.S3_BUCKET }}" >> $GITHUB_ENV
-          fi
-
-      - name: Check if CodeDeploy application and group exist
-        id: check-codedeploy
-        run: |
-          if aws deploy get-application --application-name ${{ env.CODE_DEPLOY_APP }} > /dev/null 2>&1; then
-            echo "CODEDEPLOY_APP_EXISTS=true" >> $GITHUB_ENV
-            if aws deploy get-deployment-group --application-name ${{ env.CODE_DEPLOY_APP }} --deployment-group-name ${{ env.CODE_DEPLOY_GROUP }} > /dev/null 2>&1; then
-              echo "CODEDEPLOY_GROUP_EXISTS=true" >> $GITHUB_ENV
-              echo "CodeDeploy application and deployment group exist"
-            else
-              echo "CODEDEPLOY_GROUP_EXISTS=false" >> $GITHUB_ENV
-              echo "CodeDeploy deployment group does not exist"
-            fi
-          else
-            echo "CODEDEPLOY_APP_EXISTS=false" >> $GITHUB_ENV
-            echo "CODEDEPLOY_GROUP_EXISTS=false" >> $GITHUB_ENV
-            echo "CodeDeploy application does not exist"
-          fi
-
-      - name: Register new task definition
-        id: register-task
-        run: |
-          # Check if we need to update an existing task definition or create a new one
-          if jq -e '.taskDefinitionArn' task-definition.json > /dev/null 2>&1; then
-            # Update existing task definition
-            echo "Updating existing task definition..."
-            UPDATED_TASK_DEF=$(jq --arg image "$ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}" \
-              '.containerDefinitions[0].image = $image | 
-               del(.taskDefinitionArn) | 
-               del(.revision) | 
-               del(.status) | 
-               del(.requiresAttributes) | 
-               del(.compatibilities) | 
-               del(.registeredAt) | 
-               del(.registeredBy) | 
-               del(.deregisteredAt)' task-definition.json)
-          else
-            # Use the default task definition (first deployment)
-            echo "Creating new task definition (first deployment)..."
-            UPDATED_TASK_DEF=$(cat task-definition.json)
-          fi
-          
-          echo "$UPDATED_TASK_DEF" > updated-task-definition.json
-          
-          # Register the new task definition
-          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
-            --cli-input-json file://updated-task-definition.json \
-            --query 'taskDefinition.taskDefinitionArn' \
-            --output text)
-          
-          echo "NEW_TASK_DEF_ARN=$NEW_TASK_DEF_ARN" >> $GITHUB_ENV
-          echo "Registered new task definition: $NEW_TASK_DEF_ARN"
-
-      - name: Update appspec.json with new task definition ARN
-        run: |
-          # Replace the placeholder with the actual task definition ARN
-          sed -i "s|<TASK_DEFINITION>|$NEW_TASK_DEF_ARN|g" appspec.json
-          echo "Updated appspec.json:"
-          cat appspec.json
-
-      - name: Check for active deployments
-        id: check-active-deployments
-        run: |
-          # Check for active deployments
-          ACTIVE_DEPLOYMENTS=$(aws deploy list-deployments \
-            --application-name ${{ env.CODE_DEPLOY_APP }} \
-            --deployment-group-name ${{ env.CODE_DEPLOY_GROUP }} \
-            --include-only-statuses InProgress Queued Ready \
-            --query 'deployments[0]' \
-            --output text)
-          
-          if [ -n "$ACTIVE_DEPLOYMENTS" ] && [ "$ACTIVE_DEPLOYMENTS" != "None" ]; then
-            echo "ACTIVE_DEPLOYMENT_EXISTS=true" >> $GITHUB_ENV
-            echo "ACTIVE_DEPLOYMENT_ID=$ACTIVE_DEPLOYMENTS" >> $GITHUB_ENV
-            echo "Active deployment found: $ACTIVE_DEPLOYMENTS"
-          else
-            echo "ACTIVE_DEPLOYMENT_EXISTS=false" >> $GITHUB_ENV
-            echo "No active deployments found"
-          fi
-
-      - name: Stop active deployment if exists
-        if: env.ACTIVE_DEPLOYMENT_EXISTS == 'true'
-        run: |
-          echo "Stopping active deployment: $ACTIVE_DEPLOYMENT_ID"
-          aws deploy stop-deployment \
-            --deployment-id $ACTIVE_DEPLOYMENT_ID \
-            --auto-rollback-enabled
-          echo "Deployment stopped. Waiting for cleanup..."
-          sleep 15
-
-      - name: Upload AppSpec to S3 for CodeDeploy
-        run: |
-          # Create a unique S3 key for this deployment
-          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-          S3_KEY="appspec/appspec-${TIMESTAMP}-${GITHUB_SHA:0:8}.json"
-          
-          # Upload to S3
-          aws s3 cp appspec.json s3://$S3_BUCKET/$S3_KEY --content-type application/json
-          
-          echo "S3_OBJECT_URL=s3://$S3_BUCKET/$S3_KEY" >> $GITHUB_ENV
-          echo "Uploaded appspec.json to S3: s3://$S3_BUCKET/$S3_KEY"
-
-      - name: Create CodeDeploy deployment using S3
-        run: |
-          # Extract just the key from the full S3 URL
-          S3_KEY=$(echo $S3_OBJECT_URL | cut -d'/' -f4-)
-
-          echo "Creating CodeDeploy deployment using S3 object: $S3_KEY"
-
-          # Create a temporary file for the revision JSON
-          cat > revision.json << EOF
-          {
-            "revisionType": "S3",
-            "s3Location": {
-              "bucket": "$S3_BUCKET",
-              "key": "$S3_KEY",
-              "bundleType": "JSON"
+          # Image details for CodePipeline (correct format)
+          cat > imagedefinitions.json << EOF
+          [
+            {
+              "name": "${{ env.CONTAINER_NAME }}",
+              "imageUri": "$IMAGE_URI"
             }
-          }
+          ]
           EOF
 
-          DEPLOYMENT_ID=$(aws deploy create-deployment \
-            --application-name ${{ env.CODE_DEPLOY_APP }} \
-            --deployment-group-name ${{ env.CODE_DEPLOY_GROUP }} \
-            --revision file://revision.json \
-            --query 'deploymentId' \
-            --output text)
+          echo "Created deployment files:"
+          ls -la *.yml *.json
 
-          if [ -n "$DEPLOYMENT_ID" ] && [ "$DEPLOYMENT_ID" != "None" ]; then
-            echo "DEPLOYMENT_ID=$DEPLOYMENT_ID" >> $GITHUB_ENV
-            echo "Created CodeDeploy deployment: $DEPLOYMENT_ID"
-          else
-            echo "Failed to create CodeDeploy deployment"
-            exit 1
-          fi
+      - name: Create and upload deployment zip for CodePipeline
+        run: |
+          zip deployment-files.zip appspec.yml taskdef.json imagedefinitions.json
+          aws s3 cp deployment-files.zip s3://${{ env.S3_BUCKET }}/deployment-files.zip --region ${{ env.AWS_REGION }}
+          echo "Uploaded deployment zip for CodePipeline to: s3://${{ env.S3_BUCKET }}/deployment-files.zip"
+
+      - name: Start CodePipeline execution
+        run: |
+          # Start the CodePipeline execution
+          aws codepipeline start-pipeline-execution --name SpringBootPipeline --region ${{ env.AWS_REGION }}
+          echo "Triggered CodePipeline execution for: SpringBootPipeline"
+
+      - name: Deployment Summary
+        run: |
+          echo "🚀 Deployment Summary:"
+          echo "- Docker image pushed to ECR with 'latest' tag"
+          echo "- Deployment files (ZIP) uploaded to S3"
+          echo "- CodePipeline execution triggered"
+          echo "- Monitor pipeline at: https://eu-west-1.console.aws.amazon.com/codesuite/codepipeline/pipelines/SpringBootPipeline/view"
