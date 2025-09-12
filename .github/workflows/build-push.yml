@@ -1,152 +1,86 @@
-name: Build and Push to Amazon ECR
-
-on:
-  push:
-    branches: ["main"]
-
-permissions:
-  id-token: write
-  contents: read
-
-env:
-  AWS_REGION: "eu-west-1"
-  ECR_REPOSITORY: "spring-boot-app-repo"
-  S3_BUCKET: "springboot-codedeploy-artifacts"
-  ECS_TASK_DEFINITION: "spring-boot-task-definition"
-  CONTAINER_NAME: "spring-boot-container"
-  ECS_CLUSTER_STACK_NAME: "taylor-ecs-iam-policy"
-  CONTAINER_PORT: 8080
-
-jobs:
-  build-and-push:
-    name: Build and Push Docker Image
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up JDK
-        uses: actions/setup-java@v4
-        with:
-          java-version: '21'
-          distribution: 'temurin'
-
-      - name: Build with Maven
-        run: mvn clean package
-
-      - name: Configure AWS Credentials using OIDC
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::714377355835:role/taylor-ecs-iam-policy-GitHubOidcRole-CqMPvnHBh8zq
-          aws-region: ${{ env.AWS_REGION }}
-          role-session-name: ECSPushFromGitHubActions
-
-      - name: Log in to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Build, tag, and push image to Amazon ECR
-        id: build-image
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG: ${{ github.sha }}
-        run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          echo "image-uri=$ECR_REGISTRY/$ECR_REPOSITORY:latest" >> $GITHUB_OUTPUT
-
-      - name: Get ECS Task Execution Role ARN
-        id: get-execution-role
-        run: |
-          EXECUTION_ROLE_ARN=$(aws cloudformation describe-stacks \
-            --stack-name ${{ env.ECS_CLUSTER_STACK_NAME }} \
-            --query 'Stacks[0].Outputs[?OutputKey==`EcsTaskExecutionRoleArn`].OutputValue' \
-            --output text)
-          echo "execution-role-arn=$EXECUTION_ROLE_ARN" >> $GITHUB_OUTPUT
-
-      - name: Create deployment files
-        env:
-          IMAGE_URI: ${{ steps.build-image.outputs.image-uri }}
-          EXECUTION_ROLE_ARN: ${{ steps.get-execution-role.outputs.execution-role-arn }}
-        run: |
-          # CodeDeploy AppSpec (YAML format for reliability)
-          cat > appspec.yml << EOF
-          version: 0.0
-          Resources:
-            - TargetService:
-                Type: AWS::ECS::Service
-                Properties:
-                  TaskDefinition: <TASK_DEFINITION>
-                  LoadBalancerInfo:
-                    ContainerName: "${{ env.CONTAINER_NAME }}"
-                    ContainerPort: ${{ env.CONTAINER_PORT }}
-          EOF
-
-          # ECS Task Definition JSON
-          cat > taskdef.json << EOF
-          {
-            "family": "${{ env.ECS_TASK_DEFINITION }}",
-            "networkMode": "awsvpc",
-            "requiresCompatibilities": ["FARGATE"],
-            "cpu": "256",
-            "memory": "512",
-            "executionRoleArn": "$EXECUTION_ROLE_ARN",
-            "containerDefinitions": [
-              {
-                "name": "${{ env.CONTAINER_NAME }}",
-                "image": "$IMAGE_URI",
-                "essential": true,
-                "portMappings": [
-                  {
-                    "containerPort": ${{ env.CONTAINER_PORT }},
-                    "protocol": "tcp"
-                  }
-                ],
-                "logConfiguration": {
-                  "logDriver": "awslogs",
-                  "options": {
-                    "awslogs-group": "/ecs/${{ env.ECS_TASK_DEFINITION }}",
-                    "awslogs-region": "${{ env.AWS_REGION }}",
-                    "awslogs-stream-prefix": "ecs"
-                  }
-                }
-              }
-            ]
-          }
-          EOF
-
-          # Image details for CodePipeline (correct format)
-          cat > imagedefinitions.json << EOF
-          [
+- name: Create deployment files
+  env:
+    IMAGE_URI: ${{ steps.build-image.outputs.image-uri }}
+    EXECUTION_ROLE_ARN: ${{ steps.get-execution-role.outputs.execution-role-arn }}
+  run: |
+    # CodeDeploy AppSpec
+    cat > appspec.yml << EOF
+    version: 0.0
+    Resources:
+      - TargetService:
+          Type: AWS::ECS::Service
+          Properties:
+            TaskDefinition: <TASK_DEFINITION>
+            LoadBalancerInfo:
+              ContainerName: "${{ env.CONTAINER_NAME }}"
+              ContainerPort: ${{ env.CONTAINER_PORT }}
+    EOF
+    
+    # ECS Task Definition JSON
+    cat > taskdef.json << EOF
+    {
+      "family": "${{ env.ECS_TASK_DEFINITION }}",
+      "networkMode": "awsvpc",
+      "requiresCompatibilities": ["FARGATE"],
+      "cpu": "256",
+      "memory": "512",
+      "executionRoleArn": "$EXECUTION_ROLE_ARN",
+      "containerDefinitions": [
+        {
+          "name": "${{ env.CONTAINER_NAME }}",
+          "image": "$IMAGE_URI",
+          "essential": true,
+          "portMappings": [
             {
-              "name": "${{ env.CONTAINER_NAME }}",
-              "imageUri": "$IMAGE_URI"
+              "containerPort": ${{ env.CONTAINER_PORT }},
+              "protocol": "tcp"
             }
-          ]
-          EOF
+          ],
+          "logConfiguration": {
+            "logDriver": "awslogs",
+            "options": {
+              "awslogs-group": "/ecs/${{ env.ECS_TASK_DEFINITION }}",
+              "awslogs-region": "${{ env.AWS_REGION }}",
+              "awslogs-stream-prefix": "ecs"
+            }
+          }
+        }
+      ]
+    }
+    EOF
+    
+    # Image details for CodePipeline
+    cat > imagedefinitions.json << EOF
+    [
+      {
+        "name": "${{ env.CONTAINER_NAME }}",
+        "imageUri": "$IMAGE_URI"
+      }
+    ]
+    EOF
+    
+    echo "Created deployment files:"
+    ls -la *.yml *.json || { echo "Error: Deployment files not found"; exit 1; }
 
-          echo "Created deployment files:"
-          ls -la *.yml *.json
+- name: Install zip utility
+  run: |
+    sudo apt-get update
+    sudo apt-get install -y zip
+    zip --version || { echo "Error: zip utility not installed"; exit 1; }
 
-      - name: Create and upload deployment zip for CodePipeline
-        run: |
-          zip deployment-files.zip appspec.yml taskdef.json imagedefinitions.json
-          aws s3 cp deployment-files.zip s3://${{ env.S3_BUCKET }}/deployment-files.zip --region ${{ env.AWS_REGION }}
-          echo "Uploaded deployment zip for CodePipeline to: s3://${{ env.S3_BUCKET }}/deployment-files.zip"
+- name: Create and upload deployment zip for CodePipeline
+  run: |
+    echo "Current directory:"
+    pwd
+    echo "Files in directory:"
+    ls -la
+    zip deployment-files.zip appspec.yml taskdef.json imagedefinitions.json || { echo "Error: Failed to create zip file"; exit 1; }
+    echo "Zip file created:"
+    ls -la deployment-files.zip
+    aws s3 cp deployment-files.zip s3://${{ env.S3_BUCKET }}/deployment-files.zip --region ${{ env.AWS_REGION }} || { echo "Error: Failed to upload to S3"; exit 1; }
+    echo "Uploaded deployment zip for CodePipeline to: s3://${{ env.S3_BUCKET }}/deployment-files.zip"
 
-      - name: Start CodePipeline execution
-        run: |
-          # Start the CodePipeline execution
-          aws codepipeline start-pipeline-execution --name SpringBootPipeline --region ${{ env.AWS_REGION }}
-          echo "Triggered CodePipeline execution for: SpringBootPipeline"
-
-      - name: Deployment Summary
-        run: |
-          echo "🚀 Deployment Summary:"
-          echo "- Docker image pushed to ECR with 'latest' tag"
-          echo "- Deployment files (ZIP) uploaded to S3"
-          echo "- CodePipeline execution triggered"
-          echo "- Monitor pipeline at: https://eu-west-1.console.aws.amazon.com/codesuite/codepipeline/pipelines/SpringBootPipeline/view"
+- name: Start CodePipeline execution
+  run: |
+    aws codepipeline start-pipeline-execution --name SpringBootPipeline --region ${{ env.AWS_REGION }} || { echo "Error: Failed to start CodePipeline"; exit 1; }
+    echo "Triggered CodePipeline execution for: SpringBootPipeline"
