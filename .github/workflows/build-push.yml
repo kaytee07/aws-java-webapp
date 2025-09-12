@@ -51,6 +51,8 @@ jobs:
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
           echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
 
+      # ... rest of your workflow remains the same ...
+
       - name: Generate taskdef.json
         env:
           EcsTaskExecutionRoleArn: arn:aws:iam::714377355835:role/ecsTaskExecutionRole
@@ -79,7 +81,14 @@ jobs:
           }
           EOL
 
-      - name: Generate appspec.yaml
+      - name: Register task definition and get ARN
+        id: register-taskdef
+        run: |
+          TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json file://taskdef.json --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "TASK_DEF_ARN=$TASK_DEF_ARN" >> $GITHUB_ENV
+          echo "Registered task definition: $TASK_DEF_ARN"
+
+      - name: Generate appspec.yaml with actual task definition ARN
         run: |
           cat > appspec.yaml <<EOL
           version: 0.0
@@ -87,11 +96,13 @@ jobs:
             - TargetService:
                 Type: AWS::ECS::Service
                 Properties:
-                  TaskDefinition: <TASK_DEFINITION>
+                  TaskDefinition: "$TASK_DEF_ARN"
                   LoadBalancerInfo:
                     ContainerName: spring-boot-container
                     ContainerPort: 8080
           EOL
+          echo "Generated AppSpec file:"
+          cat appspec.yaml
 
       - name: Package AppSpec bundle
         run: zip appspec-bundle.zip appspec.yaml taskdef.json
@@ -103,5 +114,6 @@ jobs:
         run: |
           echo "🚀 Deployment bundle uploaded!"
           echo "- Image: $IMAGE_URI"
+          echo "- Task Definition: $TASK_DEF_ARN"
           echo "- Bundle: s3://${{ env.ARTIFACT_BUCKET }}/appspec-bundle.zip"
           echo "- CodePipeline will automatically pick up this artifact."
