@@ -15,8 +15,7 @@ env:
   CODE_DEPLOY_APP: SpringBootCodeDeployApp
   CODE_DEPLOY_GROUP: SpringBootDeploymentGroup
   TASK_DEFINITION_FAMILY: spring-boot-task-definition
-  # Default S3 bucket name - will be overridden by CloudFormation output if available
-  S3_BUCKET: 714377355835-springboot-artifacts
+  S3_BUCKET: springboot-codedeploy-artifacts
 
 jobs:
   build-and-push:
@@ -45,7 +44,6 @@ jobs:
 
       - name: Try to get S3 bucket name from CloudFormation (optional)
         run: |
-          # Try to get S3 bucket from CloudFormation, but fall back to env variable if it fails
           if S3_BUCKET_CFN=$(aws cloudformation describe-stacks \
             --stack-name taylor-ecs-iam-policy \
             --query 'Stacks[0].Outputs[?OutputKey==`S3BucketName`].OutputValue' \
@@ -91,7 +89,6 @@ jobs:
       - name: Create default task definition if not exists
         if: env.TASK_DEF_EXISTS == 'false'
         run: |
-          # Get the actual ECS task execution role ARN from CloudFormation
           ECS_TASK_EXECUTION_ROLE_ARN=$(aws cloudformation describe-stacks \
             --stack-name taylor-ecs-iam-policy \
             --query 'Stacks[0].Outputs[?OutputKey==`EcsTaskExecutionRoleArn`].OutputValue' \
@@ -132,7 +129,6 @@ jobs:
 
       - name: Create appspec.json for CodeDeploy
         run: |
-          # Create a proper JSON file for CodeDeploy (will be updated with actual task definition ARN later)
           cat > appspec.json << EOF
           {
             "version": 0.0,
@@ -192,7 +188,6 @@ jobs:
 
       - name: Try to get S3 bucket name from CloudFormation (optional)
         run: |
-          # Try to get S3 bucket from CloudFormation, but fall back to env variable if it fails
           if S3_BUCKET_CFN=$(aws cloudformation describe-stacks \
             --stack-name taylor-ecs-iam-policy \
             --query 'Stacks[0].Outputs[?OutputKey==`S3BucketName`].OutputValue' \
@@ -225,9 +220,7 @@ jobs:
       - name: Register new task definition
         id: register-task
         run: |
-          # Check if we need to update an existing task definition or create a new one
           if jq -e '.taskDefinitionArn' task-definition.json > /dev/null 2>&1; then
-            # Update existing task definition
             echo "Updating existing task definition..."
             UPDATED_TASK_DEF=$(jq --arg image "$ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}" \
               '.containerDefinitions[0].image = $image | 
@@ -240,14 +233,12 @@ jobs:
                del(.registeredBy) | 
                del(.deregisteredAt)' task-definition.json)
           else
-            # Use the default task definition (first deployment)
             echo "Creating new task definition (first deployment)..."
             UPDATED_TASK_DEF=$(cat task-definition.json)
           fi
           
           echo "$UPDATED_TASK_DEF" > updated-task-definition.json
           
-          # Register the new task definition
           NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
             --cli-input-json file://updated-task-definition.json \
             --query 'taskDefinition.taskDefinitionArn' \
@@ -258,7 +249,6 @@ jobs:
 
       - name: Update appspec.json with new task definition ARN
         run: |
-          # Replace the placeholder with the actual task definition ARN
           sed -i "s|<TASK_DEFINITION>|$NEW_TASK_DEF_ARN|g" appspec.json
           echo "Updated appspec.json:"
           cat appspec.json
@@ -266,7 +256,6 @@ jobs:
       - name: Check for active deployments
         id: check-active-deployments
         run: |
-          # Check for active deployments
           ACTIVE_DEPLOYMENTS=$(aws deploy list-deployments \
             --application-name ${{ env.CODE_DEPLOY_APP }} \
             --deployment-group-name ${{ env.CODE_DEPLOY_GROUP }} \
@@ -295,11 +284,9 @@ jobs:
 
       - name: Upload AppSpec to S3 for CodeDeploy
         run: |
-          # Create a unique S3 key for this deployment
           TIMESTAMP=$(date +%Y%m%d-%H%M%S)
           S3_KEY="appspec/appspec-${TIMESTAMP}-${GITHUB_SHA:0:8}.json"
           
-          # Upload to S3
           aws s3 cp appspec.json s3://$S3_BUCKET/$S3_KEY
           
           echo "S3_OBJECT_URL=s3://$S3_BUCKET/$S3_KEY" >> $GITHUB_ENV
@@ -307,7 +294,6 @@ jobs:
 
       - name: Create CodeDeploy deployment using S3
         run: |
-          # Extract just the key from the full S3 URL
           S3_KEY=$(echo $S3_OBJECT_URL | cut -d'/' -f4-)
           
           echo "Creating CodeDeploy deployment using S3 object: $S3_KEY"
@@ -326,4 +312,39 @@ jobs:
             --query 'deploymentId' \
             --output text)
           
-          if [ -n "$DEPLOYMENT_ID" ] && [ "$DEPLOYMENT_ID" != "None
+          echo "Created new deployment: $DEPLOYMENT_ID"
+
+      - name: Monitor deployment status
+        run: |
+          echo "Monitoring deployment status for $DEPLOYMENT_ID..."
+          while true; do
+            STATUS=$(aws deploy get-deployment \
+              --deployment-id $DEPLOYMENT_ID \
+              --query 'deploymentInfo.status' \
+              --output text)
+          
+            echo "Current deployment status: $STATUS"
+          
+            if [ "$STATUS" = "Succeeded" ]; then
+              echo "Deployment succeeded!"
+              break
+            elif [[ "$STATUS" == "Failed" || "$STATUS" == "Stopped" ]]; then
+              echo "Deployment failed or stopped!"
+              aws deploy get-deployment \
+                --deployment-id $DEPLOYMENT_ID \
+                --query 'deploymentInfo.errorInformation' \
+                --output table
+              exit 1
+            fi
+          
+            sleep 30
+          done
+
+      - name: Post-deployment validation (optional)
+        run: |
+          echo "Deployment completed successfully. You can add health checks or tests here."
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --region ${{ env.AWS_REGION }}
+          echo "ECS service is stable."
