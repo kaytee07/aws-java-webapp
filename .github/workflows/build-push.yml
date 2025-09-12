@@ -1,4 +1,4 @@
-name: Build, Push, and Upload Deployment Bundle.
+name: Build, Push, and Upload Deployment Bundle
 
 on:
   push:
