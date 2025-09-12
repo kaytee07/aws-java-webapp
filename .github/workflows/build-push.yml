@@ -11,7 +11,7 @@ permissions:
 env:
   AWS_REGION: "eu-west-1"
   ECR_REPOSITORY: "spring-boot-app-repo"
-  ARTIFACT_BUCKET: "springboot-codedeploy-artifacts" # must match your CFN template
+  ARTIFACT_BUCKET: "714377355835-springboot-artifacts" # must match your CFN template
 
 jobs:
   build-and-deploy:
@@ -33,7 +33,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::714377355835:role/taylor-ecs-iam-policy-GitHubOidcRole-CqMPvnHBh8zq
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: eu-west-1
 
       - name: Log in to Amazon ECR
         id: login-ecr
