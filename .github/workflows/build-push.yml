@@ -286,9 +286,9 @@ jobs:
         run: |
           TIMESTAMP=$(date +%Y%m%d-%H%M%S)
           S3_KEY="appspec/appspec-${TIMESTAMP}-${GITHUB_SHA:0:8}.json"
-          
-          aws s3 cp appspec.json s3://$S3_BUCKET/$S3_KEY
-          
+
+          aws s3 cp appspec.json s3://$S3_BUCKET/$S3_KEY --content-type application/json  # ← Added --content-type flag
+
           echo "S3_OBJECT_URL=s3://$S3_BUCKET/$S3_KEY" >> $GITHUB_ENV
           echo "Uploaded appspec.json to S3: s3://$S3_BUCKET/$S3_KEY"
 
