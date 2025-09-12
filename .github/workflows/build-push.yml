@@ -52,6 +52,8 @@ jobs:
           echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
 
       - name: Generate taskdef.json
+        env:
+          EcsTaskExecutionRoleArn: arn:aws:iam::714377355835:role/ecsTaskExecutionRole
         run: |
           cat > taskdef.json <<EOL
           {
@@ -60,6 +62,7 @@ jobs:
             "requiresCompatibilities": ["FARGATE"],
             "cpu": "512",
             "memory": "1024",
+            "executionRoleArn": "${EcsTaskExecutionRoleArn}",
             "containerDefinitions": [
               {
                 "name": "spring-boot-container",
@@ -76,30 +79,22 @@ jobs:
           }
           EOL
 
-      - name: Generate appspec.json
+      - name: Generate appspec.yaml
         run: |
-          cat > appspec.json <<EOL
-          {
-            "version": 0.0,
-            "Resources": [
-              {
-                "TargetService": {
-                  "Type": "AWS::ECS::Service",
-                  "Properties": {
-                    "TaskDefinition": "<TASK_DEFINITION>",
-                    "LoadBalancerInfo": {
-                      "ContainerName": "spring-boot-container",
-                      "ContainerPort": 8080
-                    }
-                  }
-                }
-              }
-            ]
-          }
+          cat > appspec.yaml <<EOL
+          version: 0.0
+          Resources:
+            - TargetService:
+                Type: AWS::ECS::Service
+                Properties:
+                  TaskDefinition: <TASK_DEFINITION>
+                  LoadBalancerInfo:
+                    ContainerName: spring-boot-container
+                    ContainerPort: 8080
           EOL
 
       - name: Package AppSpec bundle
-        run: zip appspec-bundle.zip appspec.json taskdef.json
+        run: zip appspec-bundle.zip appspec.yaml taskdef.json
 
       - name: Upload bundle to S3
         run: aws s3 cp appspec-bundle.zip s3://${{ env.ARTIFACT_BUCKET }}/
